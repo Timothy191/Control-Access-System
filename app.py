@@ -3753,8 +3753,17 @@ def get_local_ip():
         return "localhost"
 
 
-def find_available_port(start_port=5000, end_port=5100, preferred_ports=None):
-    """Find an available port in the given range.
+def is_web_port_available(port):
+    """Check if a port is free for the main web server.
+
+    Adds the scanner-reserved ranges on top of the raw bind test, so the web
+    server is never handed a port the scanner subsystem will bind first.
+    """
+    return not is_scanner_reserved_port(port) and is_port_available(port)
+
+
+def find_available_port(start_port=8100, end_port=8200, preferred_ports=None):
+    """Find an available port for the main web server, outside scanner space.
 
     Args:
         start_port: Start of port range to scan
@@ -3767,13 +3776,13 @@ def find_available_port(start_port=5000, end_port=5100, preferred_ports=None):
     # Check preferred ports first
     if preferred_ports:
         for port in preferred_ports:
-            if is_port_available(port):
+            if is_web_port_available(port):
                 scanner_port = find_scanner_port(port + 1, port + 100)
                 return port, scanner_port
 
     # Scan range for main port
     for port in range(start_port, end_port + 1):
-        if is_port_available(port):
+        if is_web_port_available(port):
             scanner_port = find_scanner_port(port + 1, port + 100)
             return port, scanner_port
 
@@ -3781,15 +3790,40 @@ def find_available_port(start_port=5000, end_port=5100, preferred_ports=None):
 
 
 def is_port_available(port):
-    """Check if a port is available for use."""
+    """Check if a port can actually be bound for listening.
+
+    A bind test is used rather than a connect probe: the server later binds
+    the port, so only a bind attempt answers that question. Connecting to
+    0.0.0.0 is not a meaningful destination address, and a probe can report
+    a port as free when it is not bindable.
+
+    The IPv4 bind mirrors what the server does. A dual-stack IPv6 listener
+    occupies the IPv4 port as well, so it is probed too when IPv6 is usable.
+    """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex(("0.0.0.0", port))
-        sock.close()
-        return result != 0  # Port is available if connection fails
-    except Exception:
+    except OSError:
         return False
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+    try:
+        sock6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError:
+        # No IPv6 support on this host - the IPv4 result stands on its own.
+        return True
+    try:
+        sock6.bind(("::", port))
+    except OSError:
+        # A dual-stack IPv6 listener already owns this port.
+        return False
+    finally:
+        sock6.close()
+    return True
 
 
 def kill_process_on_port(port):
@@ -4099,14 +4133,29 @@ class ScannerDiscoveryService:
 
 
 # ------------------- Network Scan Listener (All Ports 5000-7000) -------------------
+
+# Single source of truth for the TCP ports owned by the scanner subsystem.
+# The main web server and the scanner HTTP server must never be placed inside
+# this range, otherwise NetworkScanListener binds the port first (it starts
+# before socketio.run) and the web server dies with EADDRINUSE.
+SCANNER_TCP_PORT_START = 5000
+SCANNER_TCP_PORT_END = 5050
+SCANNER_RESERVED_PORTS = {8080, 8081, 8082}
+
+
+def is_scanner_reserved_port(port):
+    """Return True if the scanner subsystem claims this TCP port."""
+    return SCANNER_TCP_PORT_START <= port <= SCANNER_TCP_PORT_END or port in SCANNER_RESERVED_PORTS
+
+
 class NetworkScanListener:
     """TCP socket server listening on ALL ports 5000-7000 for QR scans.
 
     Uses select() multiplexing to handle thousands of ports efficiently.
-    Completely isolated from main web server (8080) and scanner server (8081-8082).
+    Completely isolated from the main web server and scanner HTTP server.
     """
 
-    def __init__(self, start_port=5000, end_port=5050, auth_token=None):
+    def __init__(self, start_port=SCANNER_TCP_PORT_START, end_port=SCANNER_TCP_PORT_END, auth_token=None):
         self.start_port = start_port
         self.end_port = end_port
         self.auth_token = auth_token or os.environ.get(
@@ -4398,7 +4447,7 @@ class NetworkScanListener:
             return False, "Already running"
 
         # Try to bind to ALL ports in range
-        reserved_ports = {8080, 8081, 8082}
+        reserved_ports = SCANNER_RESERVED_PORTS
         success_count = 0
         fail_count = 0
 
@@ -4500,7 +4549,9 @@ class NetworkScanListener:
 
 
 # Global instances — port 9100 is dedicated for C66/InfoWedge TCP raw output
-network_listener = NetworkScanListener(start_port=5000, end_port=5050)
+network_listener = NetworkScanListener(
+    start_port=SCANNER_TCP_PORT_START, end_port=SCANNER_TCP_PORT_END
+)
 c66_tcp_listener = NetworkScanListener(start_port=9100, end_port=9100)
 discovery_service = ScannerDiscoveryService()
 
@@ -4648,13 +4699,14 @@ if __name__ == "__main__":
     # Skip port management for now - use available ports
     print("Checking for available ports...")
 
-    # Find available ports
-    preferred_ports = [8080, 5000, 3000, 8000]
+    # Find available ports. The fallback range must stay clear of the scanner
+    # subsystem's TCP range, which is bound before this server starts.
+    preferred_ports = [8080, 8000, 3000, 8443]
     try:
         main_port = 8080
-        if not is_port_available(8080):
+        if not is_web_port_available(8080):
             main_port, scanner_port = find_available_port(
-                start_port=5000, end_port=5100, preferred_ports=preferred_ports
+                start_port=8100, end_port=8200, preferred_ports=preferred_ports
             )
         else:
             # Try port 8081 first, then 8082, then find any available port
@@ -4715,7 +4767,7 @@ if __name__ == "__main__":
         "debug": False,
         "use_reloader": False,
         "host": "0.0.0.0",
-        "port": 8080,
+        "port": main_port,
     }
     # Only pass allow_unsafe_werkzeug to the development (werkzeug) server
     if socketio.async_mode == "threading":
